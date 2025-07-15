@@ -27,11 +27,13 @@ import (
 	"github.com/llm-d/llm-d-kv-cache-manager/pkg/utils"
 )
 
-const defaultChunkSize = 256
+// defaultBlockSize is the default number of tokens per block.
+// 16 is the default value used by vLLM.
+const defaultBlockSize = 16
 
 // TokenProcessorConfig holds the configuration for the token processor.
 type TokenProcessorConfig struct {
-	ChunkSize int
+	BlockSize int
 	// HashSeed is used to prefix initial hash chunks, similarly to vLLM's NONE_HASH.
 	// This should be aligned with vLLM's `PYTHONHASHSEED` environment variable.
 	// The system's deployer is responsible for aligning the vLLM deployments
@@ -44,7 +46,7 @@ type TokenProcessorConfig struct {
 // DefaultTokenProcessorConfig returns the default configuration for the token processor.
 func DefaultTokenProcessorConfig() *TokenProcessorConfig {
 	return &TokenProcessorConfig{
-		ChunkSize: defaultChunkSize,
+		BlockSize: defaultBlockSize,
 		HashSeed:  "",
 	}
 }
@@ -134,8 +136,8 @@ func (db *ChunkedTokenDatabase) prefixHashes(parentHash uint64, tokenChunks [][]
 // chunkTokens splits the input slice of tokens into chunks of size chunkSize.
 func (db *ChunkedTokenDatabase) chunkTokens(tokens []uint32) [][]uint32 {
 	var chunks [][]uint32
-	for i := 0; i < len(tokens); i += db.ChunkSize {
-		end := i + db.ChunkSize
+	for i := 0; i < len(tokens); i += db.BlockSize {
+		end := i + db.BlockSize
 		if end > len(tokens) {
 			break // no partial blocks
 		}
