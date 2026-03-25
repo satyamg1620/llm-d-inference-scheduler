@@ -49,5 +49,5 @@ runs:
           --cache-to type=gha,mode=max,scope=${{ inputs.image-name }} \
           --build-arg LDFLAGS="-s -w" \
           -t ${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.tag }} \
-          ${LATEST_TAG} -f ${{ inputs.docker-file }} --push .
+          ${LATEST_TAG} -f ${{ inputs.docker-file }} .
       shell: bash
