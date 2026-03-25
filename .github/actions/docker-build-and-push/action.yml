@@ -25,9 +25,9 @@ runs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
 
-    - name: Login to GitHub Container Registry
-      run: echo "${{ inputs.github-token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-      shell: bash
+    #- name: Login to GitHub Container Registry
+    # run: echo "${{ inputs.github-token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    #  shell: bash
 
     - name: Print image info
       run: |
@@ -49,5 +49,5 @@ runs:
           --cache-to type=gha,mode=max,scope=${{ inputs.image-name }} \
           --build-arg LDFLAGS="-s -w" \
           -t ${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.tag }} \
-          ${LATEST_TAG} -f ${{ inputs.docker-file }} --load .
+          ${LATEST_TAG} -f ${{ inputs.docker-file }} --push .
       shell: bash
