@@ -1,0 +1,38 @@
+# agentgateway standalone config — wires it as the inference gateway in front
+# of a bare-metal EPP.
+#
+# Shape borrowed from /Users/satyamgupta/agentgateway/examples/standalone-epp/.
+# Key knobs for bare-metal:
+#   - endpointPicker.host points at the EPP (Docker network DNS name: epp:9002).
+#   - destinationMode: passthrough — agentgateway forwards to whatever IP:port
+#     the EPP returns in the x-gateway-destination-endpoint header, instead of
+#     trying to validate against its own endpoint table.
+#   - The `services` entry is required by the v1 config schema but its
+#     endpoints are unused when EPP owns discovery.
+services:
+- name: sim-model
+  namespace: default
+  hostname: sim-model
+  vips: []
+  ports:
+    8000: 8000
+
+binds:
+- port: 8080
+  listeners:
+  - name: default
+    protocol: HTTP
+    routes:
+    - name: baremetal-epp-route
+      matches:
+      - path:
+          pathPrefix: /v1
+      backends:
+      - service:
+          name: default/sim-model
+          port: 8000
+        policies:
+          inferenceRouting:
+            endpointPicker:
+              host: epp:9002
+            destinationMode: passthrough

@@ -1,0 +1,66 @@
+# Bare-metal EPP scheduler / plugins configuration — REAL vLLM variant.
+#
+# Verified end-to-end on x86_64 + 2× NVIDIA L40S serving Qwen/Qwen3-8B; see
+# `bare-metal-x86-verification.md` at the repo root.
+#
+# Three bare-metal-specific facts to know about this config:
+#
+#   1. ZMQ topology is DECENTRALIZED.
+#      vLLM PUBs *bind* tcp://*:5557 (one per backend); the EPP SUBs *dial*
+#      each backend's :5557 (it discovers them via the backends file).
+#      The `kvEventsConfig.zmqEndpoint` field is a NO-OP in kv-cache@v0.8.0
+#      and must NOT be set — earlier docs that described a centralized hub
+#      were wrong.
+#
+#   2. Tokenization uses vLLM's HTTP /tokenize endpoint (no UDS sidecar, no
+#      in-process HF cache). The `token-producer` plugin is pointed at any
+#      vLLM backend; both serve the same model so they share a tokenizer.
+#
+#   3. The block size must match vLLM's `--block-size`. We use 16 here so
+#      vLLM should be launched with `--block-size 16`.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: token-producer
+    parameters:
+      modelName: Qwen/Qwen3-8B
+      vllm:
+        # Any backend works — both serve the same model and share a tokenizer.
+        # The hostname must be reachable from the EPP container (Docker DNS).
+        http: http://vllm-0:8000
+  - type: endpoint-notification-source
+  - type: metrics-data-source
+  - type: core-metrics-extractor
+  - type: single-profile-handler
+  - type: decode-filter
+  - type: precise-prefix-cache-scorer
+    parameters:
+      tokenProcessorConfig:
+        blockSize: 16          # must match vLLM --block-size
+      indexerConfig:
+        kvBlockIndexConfig:
+          enableMetrics: true
+  - type: kv-cache-utilization-scorer
+  - type: queue-scorer
+  - type: max-score-picker
+
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
+    - pluginRef: endpoint-notification-source
+      extractors:
+        - pluginRef: precise-prefix-cache-scorer
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: precise-prefix-cache-scorer
+        weight: 2.0
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 1.0
+      - pluginRef: queue-scorer
+        weight: 1.0
+      - pluginRef: max-score-picker

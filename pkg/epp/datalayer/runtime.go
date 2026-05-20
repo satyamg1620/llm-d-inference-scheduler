@@ -269,7 +269,25 @@ func (r *Runtime) findSourceByType(sourceType string, gvkFilter *schema.GroupVer
 
 // Start is called to enable the Runtime to start processing data collection. It wires
 // Kubernetes notifications into the manager.
+//
+// If mgr is nil (bare-metal mode), notification sources are skipped. Polling
+// data sources are unaffected: they spin up per-endpoint in NewEndpoint and do
+// not require a controller manager.
 func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
+	if mgr == nil {
+		// Bare-metal: warn if notification sources are configured since they
+		// cannot fire without a manager, but do not fail startup.
+		anyNotifier := false
+		r.notifiers.Range(func(_, _ any) bool {
+			anyNotifier = true
+			return false
+		})
+		if anyNotifier {
+			r.logger.Info("bare-metal mode: skipping K8s notification source binding (no controller manager); only polling sources will fire")
+		}
+		return nil
+	}
+
 	var err error
 
 	r.notifiers.Range(func(key, val any) bool { // bind notification sources to the manager

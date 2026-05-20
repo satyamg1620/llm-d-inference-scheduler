@@ -1,0 +1,54 @@
+# Bare-metal EPP scheduler config — UDS TOKENIZER variant.
+#
+# Wires the legacy gRPC-over-UDS tokenizer backend so the EPP delegates
+# prompt tokenization to a sibling container (ghcr.io/llm-d/llm-d-uds-tokenizer).
+# Both containers mount the same Docker volume at /tmp/tokenizer so the EPP
+# can dial /tmp/tokenizer/tokenizer-uds.socket.
+#
+# The precise-prefix-cache-scorer is the consumer of the tokenized prompt
+# data. Even without real KV events from the simulator, the scorer still
+# invokes the tokenizer on every request to compute block hashes — that's
+# enough to verify the UDS wiring end-to-end.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  # Produces tokenized prompt data using the UDS tokenizer backend.
+  - type: token-producer
+    parameters:
+      modelName: Qwen/Qwen3-32B
+      udsTokenizerConfig:
+        socketFile: /tmp/tokenizer/tokenizer-uds.socket
+
+  # Consumes the tokenized prompt to hash prefix blocks and score endpoints.
+  - type: precise-prefix-cache-scorer
+    parameters:
+      tokenProcessorConfig:
+        blockSize: 64
+      indexerConfig:
+        kvBlockIndexConfig:
+          enableMetrics: true
+
+  - type: endpoint-notification-source
+  - type: metrics-data-source
+  - type: core-metrics-extractor
+  - type: single-profile-handler
+  - type: decode-filter
+  - type: max-score-picker
+
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
+    - pluginRef: endpoint-notification-source
+      extractors:
+        - pluginRef: precise-prefix-cache-scorer
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: precise-prefix-cache-scorer
+        weight: 2.0
+      - pluginRef: max-score-picker

@@ -1,0 +1,31 @@
+# Bare-metal backend declaration.
+#
+# This file is the bare-metal equivalent of the Kubernetes InferencePool +
+# EndpointSlice + Pod object set. The EPP polls it (--backends-poll-interval,
+# default 10s) and reconciles its contents into the in-memory datastore.
+#
+# Pass to the EPP with:
+#   ./epp --baremetal --backends-file=/etc/llm-d/backends.yaml --config-file=/etc/llm-d/scheduler.yaml
+poolName: llama3-pool
+poolNamespace: default
+# targetPort is used when a backend entry's address has no ":port" suffix.
+targetPort: 8000
+
+backends:
+  # Decode-capable vLLM instances. The labels are propagated onto the synthetic
+  # Pod object so plugins like decode-filter / by-label-selector work unchanged.
+  - address: "192.168.1.10:8000"
+    labels:
+      llm-d.ai/role: decode
+      hardware-type: H100
+
+  - address: "192.168.1.11:8000"
+    labels:
+      llm-d.ai/role: decode
+      hardware-type: H100
+
+  # Prefill-only vLLM instance for P/D disaggregation profiles.
+  - address: "192.168.1.12:8000"
+    labels:
+      llm-d.ai/role: prefill
+      hardware-type: H100

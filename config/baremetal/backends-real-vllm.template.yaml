@@ -1,0 +1,23 @@
+# Template — the actual file consumed by the EPP is backends-real-vllm.generated.yaml,
+# written by start-stack-real-vllm{,-pull}.sh after the vLLM containers come up.
+#
+# Why a template? agentgateway's `inferenceRouting.destinationMode: passthrough`
+# parses the EPP-returned destination as a Rust SocketAddr — it only accepts
+# `IP:port`, not `hostname:port`. The container IPs aren't known until the
+# vLLM containers exist, so the launcher does `docker inspect` and a sed
+# substitution to produce the .generated file.
+poolName: qwen3-8b-pool
+poolNamespace: default
+targetPort: 8000
+
+backends:
+  - address: "__VLLM_0_IP__:8000"
+    labels:
+      llm-d.ai/role: decode
+      gpu: "0"
+      model: Qwen/Qwen3-8B
+  - address: "__VLLM_1_IP__:8000"
+    labels:
+      llm-d.ai/role: decode
+      gpu: "1"
+      model: Qwen/Qwen3-8B
