@@ -1,0 +1,19 @@
+# Backends declaration used by the Docker-networked stack.
+#
+# Containers on the `llmd-baremetal` bridge network reach each other by
+# container name. The simulators are launched as `vllm-0` and `vllm-1`, each
+# listening on port 8000 inside the network.
+poolName: sim-pool
+poolNamespace: default
+targetPort: 8000
+
+backends:
+  - address: "vllm-0:8000"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b
+
+  - address: "vllm-1:8000"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b

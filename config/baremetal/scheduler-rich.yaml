@@ -1,0 +1,76 @@
+# Rich scheduler config exercising a broad slice of plugins.
+#
+# Plugin types invoked (with their role):
+#   - decode-filter           ── filter (bylabel.DecodeRoleType)
+#   - context-length-aware    ── scorer that routes by prompt token count
+#   - prefix-cache-scorer     ── approximate prefix-cache scorer (no kv-events)
+#   - kv-cache-utilization    ── scorer reading per-backend metrics
+#   - queue-scorer            ── scorer reading per-backend metrics
+#   - session-affinity-scorer ── sticky routing by session-id header
+#   - max-score-picker        ── weighted-sum picker
+#   - single-profile-handler  ── profile orchestration
+#   - metrics-data-source     ── periodic HTTP /metrics scrape
+#   - core-metrics-extractor  ── parses vLLM metrics into pod state
+#   - endpoint-notification-source ── notifies the (approximate) prefix-cache
+#                                     of endpoint add/remove
+#
+# Pair with backends-docker-rich.generated.yaml which sets two distinct
+# `llm-d.ai/context-length-range` labels so the context-length-aware scorer
+# has something to differentiate on:
+#   vllm-0  →  "0-100"     (short-prompt specialist)
+#   vllm-1  →  "100-10000" (long-prompt specialist)
+#
+# No token-producer plugin — the simulator may not implement /tokenize. The
+# context-length-aware scorer falls back to char-based estimation
+# (characters × 0.25), which is enough to observe routing differences.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  # ─── data layer ─────────────────────────────────────────────────────────
+  - type: metrics-data-source
+  - type: core-metrics-extractor
+  - type: endpoint-notification-source
+
+  # ─── filters ───────────────────────────────────────────────────────────
+  - type: decode-filter        # only backends with llm-d.ai/role: decode
+
+  # ─── scorers ───────────────────────────────────────────────────────────
+  - type: context-length-aware
+    name: ctx-router
+    parameters:
+      label: "llm-d.ai/context-length-range"
+      enableFiltering: false   # score only; don't hard-filter
+  - type: prefix-cache-scorer
+    parameters:
+      maxPrefixBlocksToMatch: 256
+      lruCapacityPerServer: 31250
+  - type: queue-scorer
+  - type: kv-cache-utilization-scorer
+  - type: session-affinity-scorer
+
+  # ─── picker + profile handler ──────────────────────────────────────────
+  - type: max-score-picker
+  - type: single-profile-handler
+
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: ctx-router
+        weight: 5.0
+      - pluginRef: prefix-cache-scorer
+        weight: 2.0
+      - pluginRef: queue-scorer
+        weight: 1.0
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 1.0
+      - pluginRef: session-affinity-scorer
+        weight: 10.0   # weight > context-length-aware so the session pin wins
+      - pluginRef: max-score-picker

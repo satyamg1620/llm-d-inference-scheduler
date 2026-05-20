@@ -190,6 +190,14 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	logutil.InitLogging(&opts.ZapOptions)
 
+	// --- Bare-metal mode short-circuit ---
+	// When --baremetal is set, skip ctrl.GetConfig() (which would crash without
+	// a kubeconfig) and dispatch to RunStandalone, which builds the EPP without
+	// a controller-runtime manager.
+	if opts.BareMetal {
+		return r.RunStandalone(ctx, opts)
+	}
+
 	if opts.Tracing {
 		err := tracing.InitTracing(ctx, setupLog, "llm-d-inference-scheduler/epp")
 		if err != nil {

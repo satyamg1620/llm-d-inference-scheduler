@@ -13,6 +13,8 @@ include Makefile.cluster.mk
 include Makefile.kind.mk
 # Code generation targets are defined in Makefile.gen.mk
 include Makefile.gen.mk
+# Bare-metal (no Kubernetes) targets are defined in Makefile.baremetal.mk.
+include Makefile.baremetal.mk
 
 # Defaults
 TARGETOS ?= $(shell command -v go >/dev/null 2>&1 && go env GOOS || uname -s | tr '[:upper:]' '[:lower:]')

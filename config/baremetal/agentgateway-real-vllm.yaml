@@ -1,0 +1,36 @@
+# agentgateway standalone config — REAL vLLM variant.
+#
+# Differences vs the simulator config in agentgateway.yaml:
+#   * `services[0].name` is `qwen3-8b-pool` to match the poolName in
+#     backends-real-vllm.template.yaml and scheduler.yaml.
+#   * `pathPrefix: /` so that GET /v1/models (issued by some health checks
+#     and SDKs) is also routed through the EPP, not just /v1/chat/completions.
+#
+# Verified by `bare-metal-x86-verification.md`.
+services:
+  - name: qwen3-8b-pool
+    namespace: default
+    hostname: qwen3-8b-pool
+    vips: []
+    ports:
+      8000: 8000
+
+binds:
+  - port: 8080
+    listeners:
+      - name: default
+        protocol: HTTP
+        routes:
+          - name: inference
+            matches:
+              - path:
+                  pathPrefix: /
+            backends:
+              - service:
+                  name: default/qwen3-8b-pool
+                  port: 8000
+                policies:
+                  inferenceRouting:
+                    endpointPicker:
+                      host: epp:9002
+                    destinationMode: passthrough

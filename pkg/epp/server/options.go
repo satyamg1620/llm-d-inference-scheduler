@@ -101,6 +101,21 @@ type Options struct {
 	ConfigFile string // The path to the configuration file.
 	ConfigText string // The configuration specified as text, in lieu of a file.
 
+	//
+	// Bare-metal mode (no Kubernetes).
+	//
+	BareMetal           bool          // Enables bare-metal mode: skip K8s manager, use file-based backend discovery.
+	BackendsFile        string        // Path to the YAML file declaring backends (only used when BareMetal is true).
+	BackendsPollInterval time.Duration // Interval at which to re-read BackendsFile.
+
+	// Health-check (active /health probing of declared backends). When
+	// HealthCheckInterval is 0 (the default), the feature is fully disabled
+	// and the FileProvider's behavior is unchanged from earlier releases.
+	HealthCheckInterval         time.Duration // Polling interval; 0 disables health checks.
+	HealthCheckPath             string        // HTTP path probed on each backend, default "/health".
+	HealthCheckTimeout          time.Duration // Per-probe HTTP timeout.
+	HealthCheckFailureThreshold int           // Consecutive failures before removing a backend.
+
 	// internal
 	fs *pflag.FlagSet // FlagSet used in AddFlags() and consulted in Validate()
 }
@@ -130,6 +145,11 @@ func NewOptions() *Options {
 		EnablePprof:                      true,
 		SecureServing:                    true,
 		MetricsEndpointAuth:              true,
+		BackendsPollInterval:             10 * time.Second,
+		HealthCheckInterval:              0, // opt-in
+		HealthCheckPath:                  "/health",
+		HealthCheckTimeout:               2 * time.Second,
+		HealthCheckFailureThreshold:      3,
 	}
 }
 
@@ -206,6 +226,23 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Enables authentication and authorization of the metrics endpoint.")
 	fs.StringVar(&opts.ConfigFile, "config-file", opts.ConfigFile, "The path to the configuration file.")
 	fs.StringVar(&opts.ConfigText, "config-text", opts.ConfigText, "The configuration specified as text, in lieu of a file.")
+
+	fs.BoolVar(&opts.BareMetal, "baremetal", opts.BareMetal,
+		"Run in bare-metal mode (no Kubernetes). Reads backends from --backends-file and skips the controller manager and CRD reconcilers.")
+	fs.StringVar(&opts.BackendsFile, "backends-file", opts.BackendsFile,
+		"Path to the YAML file declaring backends. Required when --baremetal is set.")
+	fs.DurationVar(&opts.BackendsPollInterval, "backends-poll-interval", opts.BackendsPollInterval,
+		"Interval at which the backends file is re-read in bare-metal mode.")
+
+	fs.DurationVar(&opts.HealthCheckInterval, "health-check-interval", opts.HealthCheckInterval,
+		"Interval at which the bare-metal FileProvider probes each backend's HTTP /health endpoint. "+
+			"Zero (the default) disables active health checking. Recommended: 5s in production.")
+	fs.StringVar(&opts.HealthCheckPath, "health-check-path", opts.HealthCheckPath,
+		"HTTP path used for backend health probes (e.g. /health, /v1/models).")
+	fs.DurationVar(&opts.HealthCheckTimeout, "health-check-timeout", opts.HealthCheckTimeout,
+		"Per-probe HTTP timeout. A probe that exceeds this counts as a failure.")
+	fs.IntVar(&opts.HealthCheckFailureThreshold, "health-check-failure-threshold", opts.HealthCheckFailureThreshold,
+		"Consecutive failed probes before a backend is removed from rotation. Recovery requires one successful probe.")
 }
 
 func (opts *Options) Complete() error {
@@ -219,8 +256,17 @@ func (opts *Options) Complete() error {
 }
 
 func (opts *Options) Validate() error {
-	if (opts.PoolName != "" && opts.EndpointSelector != "") || (opts.PoolName == "" && opts.EndpointSelector == "") {
-		return errors.New("either pool-name or endpoint-selector must be set")
+	if opts.BareMetal {
+		if opts.BackendsFile == "" {
+			return errors.New("--backends-file is required when --baremetal is set")
+		}
+		if opts.PoolName != "" || opts.EndpointSelector != "" {
+			return errors.New("--pool-name and --endpoint-selector cannot be combined with --baremetal")
+		}
+	} else {
+		if (opts.PoolName != "" && opts.EndpointSelector != "") || (opts.PoolName == "" && opts.EndpointSelector == "") {
+			return errors.New("either pool-name or endpoint-selector must be set")
+		}
 	}
 	if opts.EndpointSelector != "" {
 		if len(opts.EndpointTargetPorts) == 0 || len(opts.EndpointTargetPorts) > 8 {

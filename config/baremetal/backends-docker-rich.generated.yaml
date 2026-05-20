@@ -1,0 +1,14 @@
+poolName: sim-pool
+poolNamespace: default
+targetPort: 8000
+backends:
+  - address: "172.18.0.2:8000"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b
+      llm-d.ai/context-length-range: "0-100"
+  - address: "172.18.0.3:8000"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b
+      llm-d.ai/context-length-range: "100-10000"

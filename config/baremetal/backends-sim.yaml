@@ -1,0 +1,18 @@
+# Bare-metal backends — simulator variant for scripts/baremetal/smoke-test.sh.
+#
+# The smoke-test script binds two llm-d-inference-sim containers to
+# 127.0.0.1:8001 and 127.0.0.1:8002 on the host network.
+poolName: sim-pool
+poolNamespace: default
+targetPort: 8001
+
+backends:
+  - address: "127.0.0.1:8001"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b
+
+  - address: "127.0.0.1:8002"
+    labels:
+      llm-d.ai/role: decode
+      app: vllm-qwen3-32b
