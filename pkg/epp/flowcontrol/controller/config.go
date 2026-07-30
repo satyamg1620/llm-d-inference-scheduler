@@ -24,13 +24,18 @@ import (
 )
 
 const (
-	// defaultRequestTTL is the default Time-To-Live applied to queued requests when the configuration
-	// does not specify one. It is a queue-wait budget: a request still undispatched after this long is
-	// shed with a retryable backpressure signal instead of being served with severely degraded
-	// time-to-first-token. It is also the only bound on queue wait when neither the client nor the
-	// gateway enforces a request deadline (the well-lit guides configure no gateway request timeout);
-	// where such deadlines exist and fire sooner, context cancellation evicts the request first.
+	// defaultRequestTTL is the default Time-To-Live applied to queued requests while the candidate pool
+	// has endpoints. It is a queue-wait budget for the saturation regime: endpoints are serving and the
+	// request is waiting out contention, so a request still undispatched after this long is shed with a
+	// retryable backpressure signal instead of being served with severely degraded time-to-first-token.
+	// It is also the only bound on queue wait when neither the client nor the gateway enforces a request
+	// deadline (the well-lit guides configure no gateway request timeout); where such deadlines exist and
+	// fire sooner, context cancellation evicts the request first.
 	defaultRequestTTL = 60 * time.Second
+	// defaultNoEndpointsRequestTTL is the default Time-To-Live applied to queued requests while the
+	// candidate pool is empty. Waiting is the only path to success in that regime, so the budget is sized
+	// to a cold start (image pull plus weight load) rather than to a time-to-first-token target.
+	defaultNoEndpointsRequestTTL = 300 * time.Second
 	// defaultExpiryCleanupInterval is the default frequency for scanning for expired items.
 	defaultExpiryCleanupInterval = 1 * time.Second
 	// defaultEnqueueChannelBufferSize is the default size of a worker's incoming request buffer.
@@ -40,12 +45,21 @@ const (
 // Config holds the configuration for the `FlowController`.
 type Config struct {
 	// DefaultRequestTTL is the default Time-To-Live applied to requests that do not specify their own
-	// TTL hint. Because the admission adapter does not currently plumb a per-request hint, this value
-	// governs every request entering flow control.
+	// TTL hint, and that are waiting while the candidate pool has endpoints. Because the admission
+	// adapter does not currently plumb a per-request hint, this value governs every request entering
+	// flow control in the saturation regime.
 	// Optional: Defaults to `defaultRequestTTL` (60s). An explicit zero disables the TTL entirely, in
 	// which case queued requests are bounded only by request context cancellation (client disconnect
 	// or gateway timeout).
 	DefaultRequestTTL time.Duration
+
+	// NoEndpointsRequestTTL is the Time-To-Live applied to queued requests while the candidate pool is
+	// empty. The two budgets serve opposite goals: a request waiting on a cold start can only succeed by
+	// waiting, while a request waiting on a saturated pool is better shed so the caller can retry
+	// elsewhere. A request that exhausts this budget is evicted as genuine unavailability.
+	// Optional: Defaults to `defaultNoEndpointsRequestTTL` (300s). An explicit zero disables the
+	// no-endpoint TTL entirely.
+	NoEndpointsRequestTTL time.Duration
 
 	// ExpiryCleanupInterval is the interval at which each processor scans its queues for expired items.
 	// Optional: Defaults to `defaultExpiryCleanupInterval` (1 second).
@@ -74,10 +88,13 @@ type ConfigOption func(*Config)
 
 // NewConfigFromAPI creates a new Config from the API configuration.
 func NewConfigFromAPI(apiConfig *configapi.FlowControlConfig) (*Config, error) {
-	opts := make([]ConfigOption, 0, 1)
+	opts := make([]ConfigOption, 0, 2)
 	if apiConfig != nil {
 		if apiConfig.DefaultRequestTTL != nil {
 			opts = append(opts, WithDefaultRequestTTL(apiConfig.DefaultRequestTTL.Duration))
+		}
+		if apiConfig.NoEndpointsRequestTTL != nil {
+			opts = append(opts, WithNoEndpointsRequestTTL(apiConfig.NoEndpointsRequestTTL.Duration))
 		}
 	}
 	return NewConfig(opts...)
@@ -87,6 +104,7 @@ func NewConfigFromAPI(apiConfig *configapi.FlowControlConfig) (*Config, error) {
 func NewConfig(opts ...ConfigOption) (*Config, error) {
 	c := &Config{
 		DefaultRequestTTL:        defaultRequestTTL,
+		NoEndpointsRequestTTL:    defaultNoEndpointsRequestTTL,
 		ExpiryCleanupInterval:    defaultExpiryCleanupInterval,
 		EnqueueChannelBufferSize: defaultEnqueueChannelBufferSize,
 	}
@@ -108,6 +126,13 @@ func WithDefaultRequestTTL(d time.Duration) ConfigOption {
 	}
 }
 
+// WithNoEndpointsRequestTTL sets the request TTL applied while the candidate pool is empty.
+func WithNoEndpointsRequestTTL(d time.Duration) ConfigOption {
+	return func(c *Config) {
+		c.NoEndpointsRequestTTL = d
+	}
+}
+
 // WithExpiryCleanupInterval sets the expiry cleanup interval.
 func WithExpiryCleanupInterval(d time.Duration) ConfigOption {
 	return func(c *Config) {
@@ -126,6 +151,9 @@ func WithEnqueueChannelBufferSize(size int) ConfigOption {
 func (c *Config) validate() error {
 	if c.DefaultRequestTTL < 0 {
 		return fmt.Errorf("DefaultRequestTTL cannot be negative, but got %v", c.DefaultRequestTTL)
+	}
+	if c.NoEndpointsRequestTTL < 0 {
+		return fmt.Errorf("NoEndpointsRequestTTL cannot be negative, but got %v", c.NoEndpointsRequestTTL)
 	}
 	if c.ExpiryCleanupInterval <= 0 {
 		return fmt.Errorf("ExpiryCleanupInterval must be positive, but got %v", c.ExpiryCleanupInterval)

@@ -35,7 +35,7 @@ func TestFlowItem_New(t *testing.T) {
 	req := mocks.NewMockFlowControlRequest(100, "req-1", flowcontrol.FlowKey{})
 
 	enqueueTime := time.Now()
-	item := NewItem(req, time.Minute, enqueueTime)
+	item := NewItem(req, time.Minute, time.Minute, enqueueTime)
 
 	require.NotNil(t, item, "NewItem should not return a nil item")
 	assert.Equal(t, enqueueTime, item.EnqueueTime(), "EnqueueTime should be populated")
@@ -119,7 +119,7 @@ func TestFlowItem_Finalize_Idempotency(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			item := NewItem(req, time.Minute, now)
+			item := NewItem(req, time.Minute, time.Minute, now)
 
 			// First call
 			tc.firstCall(item)
@@ -220,7 +220,7 @@ func TestFlowItem_Finalize_InferOutcome(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			req := mocks.NewMockFlowControlRequest(100, "req-1", flowcontrol.FlowKey{})
-			item := NewItem(req, time.Minute, now)
+			item := NewItem(req, time.Minute, time.Minute, now)
 			if tc.isQueued {
 				item.SetHandle(&mocks.MockQueueItemHandle{})
 			}
@@ -232,6 +232,114 @@ func TestFlowItem_Finalize_InferOutcome(t *testing.T) {
 			assert.Equal(t, tc.expectOutcome, finalState.Outcome, "Unexpected outcome")
 			require.Error(t, finalState.Err, "An error should be set")
 			assert.ErrorIs(t, finalState.Err, tc.expectErrIs, "Unexpected error type")
+		})
+	}
+}
+
+func TestFlowItem_ExpiredState(t *testing.T) {
+	t.Parallel()
+
+	const (
+		saturationTTL  = 1 * time.Minute
+		noEndpointsTTL = 10 * time.Minute
+	)
+	enqueueTime := time.Now()
+	// Before the enqueue time, i.e. the pool was already up when the request arrived.
+	poolUpBefore := enqueueTime.Add(-time.Hour)
+
+	testCases := []struct {
+		name              string
+		saturationTTL     time.Duration
+		noEndpointsTTL    time.Duration
+		elapsed           time.Duration
+		poolEmpty         bool
+		poolNonEmptySince time.Time
+		expectOutcome     types.QueueOutcome
+		expectErrIs       error
+	}{
+		{
+			name:           "EmptyPool_WithinNoEndpointBudget_ShouldWait",
+			saturationTTL:  saturationTTL,
+			noEndpointsTTL: noEndpointsTTL,
+			// Past the saturation budget: the point of the split is that this request keeps waiting.
+			elapsed:   5 * time.Minute,
+			poolEmpty: true,
+		},
+		{
+			name:           "EmptyPool_PastNoEndpointBudget_ShouldEvictAsUnavailable",
+			saturationTTL:  saturationTTL,
+			noEndpointsTTL: noEndpointsTTL,
+			elapsed:        noEndpointsTTL,
+			poolEmpty:      true,
+			expectOutcome:  types.QueueOutcomeEvictedNoEndpointsTTL,
+			expectErrIs:    types.ErrNoEndpoints,
+		},
+		{
+			name:           "EmptyPool_DisabledNoEndpointBudget_ShouldWait",
+			saturationTTL:  saturationTTL,
+			noEndpointsTTL: 0,
+			elapsed:        24 * time.Hour,
+			poolEmpty:      true,
+		},
+		{
+			name:              "NonEmptyPool_WithinSaturationBudget_ShouldWait",
+			saturationTTL:     saturationTTL,
+			noEndpointsTTL:    noEndpointsTTL,
+			elapsed:           30 * time.Second,
+			poolNonEmptySince: poolUpBefore,
+		},
+		{
+			name:              "NonEmptyPool_PastSaturationBudget_ShouldEvictAsBackpressure",
+			saturationTTL:     saturationTTL,
+			noEndpointsTTL:    noEndpointsTTL,
+			elapsed:           saturationTTL,
+			poolNonEmptySince: poolUpBefore,
+			expectOutcome:     types.QueueOutcomeEvictedTTL,
+			expectErrIs:       types.ErrTTLExpired,
+		},
+		{
+			name:              "NonEmptyPool_DisabledSaturationBudget_ShouldWait",
+			saturationTTL:     0,
+			noEndpointsTTL:    noEndpointsTTL,
+			elapsed:           24 * time.Hour,
+			poolNonEmptySince: poolUpBefore,
+		},
+		{
+			// The scale-from-zero handoff: a request that waited out a cold start must not be shed the instant it
+			// becomes servable against a saturation budget it exhausted while nothing could serve it.
+			name:              "ScaledUp_WithinFreshSaturationBudget_ShouldWait",
+			saturationTTL:     saturationTTL,
+			noEndpointsTTL:    noEndpointsTTL,
+			elapsed:           5 * time.Minute,
+			poolNonEmptySince: enqueueTime.Add(5 * time.Minute),
+		},
+		{
+			name:              "ScaledUp_PastFreshSaturationBudget_ShouldEvictAsBackpressure",
+			saturationTTL:     saturationTTL,
+			noEndpointsTTL:    noEndpointsTTL,
+			elapsed:           5*time.Minute + saturationTTL,
+			poolNonEmptySince: enqueueTime.Add(5 * time.Minute),
+			expectOutcome:     types.QueueOutcomeEvictedTTL,
+			expectErrIs:       types.ErrTTLExpired,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := mocks.NewMockFlowControlRequest(100, "req-1", flowcontrol.FlowKey{})
+			item := NewItem(req, tc.saturationTTL, tc.noEndpointsTTL, enqueueTime)
+
+			state := item.ExpiredState(enqueueTime.Add(tc.elapsed), tc.poolEmpty, tc.poolNonEmptySince)
+
+			if tc.expectOutcome == types.QueueOutcomeNotYetFinalized {
+				assert.Nil(t, state, "Item should still be allowed to wait")
+				return
+			}
+			require.NotNil(t, state, "Item should be expired")
+			assert.Equal(t, tc.expectOutcome, state.Outcome, "Unexpected outcome")
+			assert.ErrorIs(t, state.Err, types.ErrEvicted, "Error should wrap ErrEvicted")
+			assert.ErrorIs(t, state.Err, tc.expectErrIs, "Unexpected underlying error")
 		})
 	}
 }

@@ -363,14 +363,25 @@ type FlowControlConfig struct {
 	MaxRequests *resource.Quantity `json:"maxRequests,omitempty"`
 
 	// +optional
-	// DefaultRequestTTL bounds how long a request may wait in the queue before it is evicted.
-	// If omitted, it defaults to 60s. This is a queue-wait budget: a request that cannot dispatch
-	// within it is shed with a retryable backpressure error rather than served late, and it is the
-	// only bound on queue wait when neither the client nor the gateway enforces a request deadline.
-	// Where such deadlines exist and fire sooner, they evict the request first (client disconnect).
+	// DefaultRequestTTL bounds how long a request may wait in the queue while the pool has endpoints.
+	// If omitted, it defaults to 60s. This is a queue-wait budget for the saturation regime: endpoints
+	// are serving and the request is waiting out contention, so a request that cannot dispatch within it
+	// is shed with a retryable backpressure error rather than served late. It is the only bound on queue
+	// wait when neither the client nor the gateway enforces a request deadline. Where such deadlines
+	// exist and fire sooner, they evict the request first (client disconnect).
 	// An explicit "0s" disables the TTL: requests then wait until client disconnect or controller
 	// shutdown.
 	DefaultRequestTTL *metav1.Duration `json:"defaultRequestTTL,omitempty"`
+
+	// +optional
+	// NoEndpointsRequestTTL bounds how long a request may wait in the queue while the pool has no
+	// endpoints. If omitted, it defaults to 300s. Waiting is the only path to success in that regime,
+	// so this budget is sized to a cold start (image pull plus weight load) rather than to a
+	// time-to-first-token target, and a request that exhausts it is failed as unavailable rather than
+	// as backpressure. Deployments that do not scale from zero should set it to the same value as
+	// DefaultRequestTTL.
+	// An explicit "0s" disables the no-endpoint TTL.
+	NoEndpointsRequestTTL *metav1.Duration `json:"noEndpointsRequestTTL,omitempty"`
 
 	// +optional
 	// DefaultPriorityBand allows you to define a template for handling traffic with priority levels
@@ -428,6 +439,10 @@ func (fcc *FlowControlConfig) String() string {
 
 	if fcc.DefaultRequestTTL != nil {
 		parts = append(parts, fmt.Sprintf("DefaultRequestTTL: %s", fcc.DefaultRequestTTL.Duration))
+	}
+
+	if fcc.NoEndpointsRequestTTL != nil {
+		parts = append(parts, fmt.Sprintf("NoEndpointsRequestTTL: %s", fcc.NoEndpointsRequestTTL.Duration))
 	}
 
 	if fcc.DefaultPriorityBand != nil {

@@ -42,6 +42,7 @@ func TestNewConfig(t *testing.T) {
 			expectErr: false,
 			expectedCfg: Config{
 				DefaultRequestTTL:        defaultRequestTTL,
+				NoEndpointsRequestTTL:    defaultNoEndpointsRequestTTL,
 				ExpiryCleanupInterval:    defaultExpiryCleanupInterval,
 				EnqueueChannelBufferSize: defaultEnqueueChannelBufferSize,
 			},
@@ -54,6 +55,7 @@ func TestNewConfig(t *testing.T) {
 			expectErr: false,
 			expectedCfg: Config{
 				DefaultRequestTTL:        0,
+				NoEndpointsRequestTTL:    defaultNoEndpointsRequestTTL,
 				ExpiryCleanupInterval:    defaultExpiryCleanupInterval,
 				EnqueueChannelBufferSize: defaultEnqueueChannelBufferSize,
 			},
@@ -66,6 +68,7 @@ func TestNewConfig(t *testing.T) {
 			expectErr: false,
 			expectedCfg: Config{
 				DefaultRequestTTL:        10 * time.Second,
+				NoEndpointsRequestTTL:    defaultNoEndpointsRequestTTL,
 				ExpiryCleanupInterval:    defaultExpiryCleanupInterval,
 				EnqueueChannelBufferSize: defaultEnqueueChannelBufferSize,
 			},
@@ -74,12 +77,14 @@ func TestNewConfig(t *testing.T) {
 			name: "WithAllOptions_ShouldUpdateConfig",
 			opts: []ConfigOption{
 				WithDefaultRequestTTL(10 * time.Second),
+				WithNoEndpointsRequestTTL(4 * time.Minute),
 				WithExpiryCleanupInterval(2 * time.Second),
 				WithEnqueueChannelBufferSize(50),
 			},
 			expectErr: false,
 			expectedCfg: Config{
 				DefaultRequestTTL:        10 * time.Second,
+				NoEndpointsRequestTTL:    4 * time.Minute,
 				ExpiryCleanupInterval:    2 * time.Second,
 				EnqueueChannelBufferSize: 50,
 			},
@@ -88,6 +93,26 @@ func TestNewConfig(t *testing.T) {
 			name: "NegativeDefaultRequestTTL_ShouldError",
 			opts: []ConfigOption{
 				WithDefaultRequestTTL(-1 * time.Second),
+			},
+			expectErr: true,
+		},
+		{
+			name: "ZeroNoEndpointsRequestTTL_ShouldDisableNoEndpointTTL",
+			opts: []ConfigOption{
+				WithNoEndpointsRequestTTL(0),
+			},
+			expectErr: false,
+			expectedCfg: Config{
+				DefaultRequestTTL:        defaultRequestTTL,
+				NoEndpointsRequestTTL:    0,
+				ExpiryCleanupInterval:    defaultExpiryCleanupInterval,
+				EnqueueChannelBufferSize: defaultEnqueueChannelBufferSize,
+			},
+		},
+		{
+			name: "NegativeNoEndpointsRequestTTL_ShouldError",
+			opts: []ConfigOption{
+				WithNoEndpointsRequestTTL(-1 * time.Second),
 			},
 			expectErr: true,
 		},

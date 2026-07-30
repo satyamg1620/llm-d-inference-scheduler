@@ -371,7 +371,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(t.Context())
 			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
-			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, 0, time.Now())
 
 			result := make(chan struct {
 				outcome types.QueueOutcome
@@ -402,7 +402,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
 			reqCtx, reqCancel := context.WithCancel(context.Background())
-			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, 0, time.Now())
 
 			reqCancel()
 			cancel()
@@ -418,7 +418,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(t.Context())
 			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
-			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, time.Now())
+			item := internal.NewItem(newTestRequest(defaultFlowKey), 0, 0, time.Now())
 			item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
 
 			cancel()
@@ -752,11 +752,13 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				"Item's internal outcome must match the returned outcome")
 		})
 
-		// Validates the asynchronous finalization path due to TTL expiry.
+		// Validates the asynchronous finalization path when the request context's own deadline expires after
+		// distribution. Queue-wait budgets are enforced by the processor's expiry sweep, which this test's mock
+		// processor does not run, so the deadline under test is the caller's.
 		// Note: This relies on real time passing, as context.WithDeadline timers cannot be controlled by FakeClock.
 		t.Run("OnReqCtxTimeoutAfterDistribution", func(t *testing.T) {
 			t.Parallel()
-			// Configure a short TTL to keep the test reasonably fast.
+			// Configure a short caller deadline to keep the test reasonably fast.
 
 			itemSubmitted := make(chan *internal.FlowItem, 1)
 
@@ -769,10 +771,10 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				},
 			}
 
-			const requestTTL = 50 * time.Millisecond
+			const callerTimeout = 50 * time.Millisecond
 			h := newUnitHarness(t.Context(), t, &Config{
-				DefaultRequestTTL:     requestTTL,
-				ExpiryCleanupInterval: time.Minute,
+				DefaultRequestTTL:     time.Minute,
+				ExpiryCleanupInterval: time.Second,
 			}, nil, processor, withHarnessClock(clock.RealClock{}))
 
 			h.mockRegistry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(_ contracts.ActiveFlowConnection) error) error {
@@ -783,8 +785,8 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			}
 
 			req := newTestRequest(defaultFlowKey)
-			// Use a context for the call itself that won't time out independently.
-			enqueueCtx, enqueueCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			// The caller's deadline is the one under test; it fires well before the controller's backstop.
+			enqueueCtx, enqueueCancel := context.WithTimeout(context.Background(), callerTimeout)
 			defer enqueueCancel()
 
 			var outcome types.QueueOutcome
@@ -805,14 +807,14 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				t.Fatal("timed out waiting for item to be submitted to the processor")
 			}
 
-			// 2.Wait for the TTL to expire (Real time). We do NOT call Step().
-			// Wait for EnqueueAndWait to return due to the TTL expiry.
+			// 2.Wait for the deadline to expire (Real time). We do NOT call Step().
+			// Wait for EnqueueAndWait to return due to the deadline expiry.
 			select {
 			case <-done:
 				// Success. Now validate that enough time actually passed.
 				duration := time.Since(startTime)
-				assert.GreaterOrEqual(t, duration, requestTTL-30*time.Millisecond, // tolerance for CI environments
-					"EnqueueAndWait returned faster than the TTL allows, indicating the timer did not function correctly")
+				assert.GreaterOrEqual(t, duration, callerTimeout-30*time.Millisecond, // tolerance for CI environments
+					"EnqueueAndWait returned faster than the deadline allows, indicating the timer did not function correctly")
 			case <-time.After(1 * time.Second):
 				t.Fatal("timed out waiting for EnqueueAndWait to return after TTL expiry")
 			}

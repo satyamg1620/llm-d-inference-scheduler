@@ -338,16 +338,15 @@ func (fc *FlowController) tryDistribution(
 	enqueueTime time.Time,
 	conn contracts.ActiveFlowConnection,
 ) (*internal.FlowItem, error) {
-	// Calculate effective TTL for item initialization (reqCtx is the enforcement mechanism).
-	effectiveTTL := fc.config.DefaultRequestTTL
+	// Calculate the per-regime queue-wait budgets for item initialization. The processor's expiry sweep enforces
+	// whichever one is in effect; reqCtx remains the outer bound.
+	budgets := fc.resolveBudgets(req)
 	if deadline, ok := reqCtx.Deadline(); ok {
-		if ttl := deadline.Sub(enqueueTime); ttl > 0 {
-			effectiveTTL = ttl
-		}
+		budgets = budgets.clampTo(deadline.Sub(enqueueTime))
 	}
 
 	// We must create a fresh FlowItem on each attempt as finalization is per-lifecycle.
-	item := internal.NewItem(req, effectiveTTL, enqueueTime)
+	item := internal.NewItem(req, budgets.saturation, budgets.noEndpoints, enqueueTime)
 
 	dp := conn.GetDataPlane()
 	_, err := dp.ManagedQueue(conn.FlowKey())
@@ -416,19 +415,66 @@ func (fc *FlowController) awaitFinalization(
 	}
 }
 
-// createRequestContext derives the context that governs a request's lifecycle, enforcing the TTL deadline.
+// ttlBudgets holds a request's queue-wait budget for each unavailability regime. The two serve opposite goals: a
+// request waiting on an empty pool can only succeed by waiting, while a request waiting on a saturated pool is better
+// shed so the caller can retry elsewhere.
+type ttlBudgets struct {
+	// saturation applies while the candidate pool has endpoints.
+	saturation time.Duration
+	// noEndpoints applies while the candidate pool is empty.
+	noEndpoints time.Duration
+}
+
+// longest returns the budget that bounds queue wait across every regime. Zero means no regime bounds it.
+func (b ttlBudgets) longest() time.Duration {
+	return max(b.saturation, b.noEndpoints)
+}
+
+// clampTo shortens both budgets to the queue wait that the request context actually allows, so an item never claims a
+// longer wait than it can be granted. A disabled budget (zero) adopts the limit for the same reason.
+func (b ttlBudgets) clampTo(limit time.Duration) ttlBudgets {
+	if limit <= 0 {
+		return b
+	}
+	if b.saturation <= 0 || b.saturation > limit {
+		b.saturation = limit
+	}
+	if b.noEndpoints <= 0 || b.noEndpoints > limit {
+		b.noEndpoints = limit
+	}
+	return b
+}
+
+// resolveBudgets returns the configured queue-wait budgets for a request.
+//
+// A request carrying its own TTL hint gets that value in both regimes: an explicit request deadline states the caller's
+// own tolerance for waiting, which does not change with the reason the pool cannot serve it.
+func (fc *FlowController) resolveBudgets(req flowcontrol.FlowControlRequest) ttlBudgets {
+	if hint := req.InitialEffectiveTTL(); hint > 0 {
+		return ttlBudgets{saturation: hint, noEndpoints: hint}
+	}
+	return ttlBudgets{
+		saturation:  fc.config.DefaultRequestTTL,
+		noEndpoints: fc.config.NoEndpointsRequestTTL,
+	}
+}
+
+// createRequestContext derives the context that governs a request's lifecycle, arming the backstop deadline.
+//
+// The processor's expiry sweep decides which budget binds, because that depends on the unavailability regime in effect
+// at the time and the regime changes while the item waits. This deadline is therefore only a backstop: it bounds items
+// the sweep cannot reach (still buffered in a processor's enqueue channel) and items whose saturation budget a flapping
+// pool keeps re-charging. It sits two sweep intervals past the longest budget so that a sweep observing the deadline
+// late still wins, keeping the regime-labelled outcome rather than a generic TTL expiry.
 func (fc *FlowController) createRequestContext(
 	ctx context.Context,
 	req flowcontrol.FlowControlRequest,
 ) (context.Context, context.CancelFunc, time.Time) {
 	enqueueTime := fc.clock.Now()
-	effectiveTTL := req.InitialEffectiveTTL()
-	if effectiveTTL <= 0 {
-		effectiveTTL = fc.config.DefaultRequestTTL
-	}
 
-	if effectiveTTL > 0 {
-		reqCtx, cancel := context.WithDeadlineCause(ctx, enqueueTime.Add(effectiveTTL), types.ErrTTLExpired)
+	if longest := fc.resolveBudgets(req).longest(); longest > 0 {
+		backstop := enqueueTime.Add(longest + 2*fc.config.ExpiryCleanupInterval)
+		reqCtx, cancel := context.WithDeadlineCause(ctx, backstop, types.ErrTTLExpired)
 		return reqCtx, cancel, enqueueTime
 	}
 	reqCtx, cancel := context.WithCancel(ctx)

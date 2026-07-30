@@ -53,6 +53,7 @@ type FlowItem struct {
 
 	enqueueTime     time.Time
 	effectiveTTL    time.Duration
+	noEndpointsTTL  time.Duration
 	originalRequest flowcontrol.FlowControlRequest
 
 	// --- Synchronized State ---
@@ -81,10 +82,19 @@ type FlowItem struct {
 var _ flowcontrol.QueueItemAccessor = &FlowItem{}
 
 // NewItem allocates and initializes a new FlowItem for a request lifecycle.
-func NewItem(req flowcontrol.FlowControlRequest, effectiveTTL time.Duration, enqueueTime time.Time) *FlowItem {
+//
+// The item carries one queue-wait budget per unavailability regime: effectiveTTL applies while the candidate pool has
+// endpoints, noEndpointsTTL while it is empty. Which one binds is resolved by ExpiredState on every expiry scan rather
+// than fixed here, because a pool going from empty to non-empty is the entire point of scale-from-zero.
+func NewItem(
+	req flowcontrol.FlowControlRequest,
+	effectiveTTL, noEndpointsTTL time.Duration,
+	enqueueTime time.Time,
+) *FlowItem {
 	return &FlowItem{
 		enqueueTime:     enqueueTime,
 		effectiveTTL:    effectiveTTL,
+		noEndpointsTTL:  noEndpointsTTL,
 		originalRequest: req,
 		done:            make(chan *FinalState, 1),
 	}
@@ -93,8 +103,50 @@ func NewItem(req flowcontrol.FlowControlRequest, effectiveTTL time.Duration, enq
 // EnqueueTime returns the time the item was logically accepted by the FlowController.
 func (fi *FlowItem) EnqueueTime() time.Time { return fi.enqueueTime }
 
-// EffectiveTTL returns the actual time-to-live assigned to this item.
+// EffectiveTTL returns the time-to-live assigned to this item for the saturation regime, which is the budget that
+// binds whenever the candidate pool has endpoints. Ordering policies use it to derive an absolute deadline.
 func (fi *FlowItem) EffectiveTTL() time.Duration { return fi.effectiveTTL }
+
+// NoEndpointsTTL returns the time-to-live assigned to this item for the empty-pool regime.
+func (fi *FlowItem) NoEndpointsTTL() time.Duration { return fi.noEndpointsTTL }
+
+// ExpiredState returns the terminal state for an item whose queue-wait budget is exhausted as of now, or nil if the
+// item may keep waiting. A zero budget for the regime in effect disables expiry for that regime.
+//
+// While the pool is empty, the no-endpoint budget runs from the enqueue time: waiting is the only path to success, so
+// the whole wait is charged to the cold start. While the pool has endpoints, the saturation budget runs from the later
+// of the enqueue time and poolNonEmptySince, the moment the pool last became non-empty. Charging from the transition
+// grants a request that waited out a cold start a full saturation budget in which to dispatch, instead of shedding it
+// the instant it becomes servable against a budget it had already exhausted while nothing could serve it.
+//
+// A pool that flaps empty restarts the saturation budget on each transition, so the caller's context deadline remains
+// the outer bound on total queue wait.
+func (fi *FlowItem) ExpiredState(now time.Time, poolEmpty bool, poolNonEmptySince time.Time) *FinalState {
+	if poolEmpty {
+		if fi.noEndpointsTTL <= 0 || now.Sub(fi.enqueueTime) < fi.noEndpointsTTL {
+			return nil
+		}
+		return &FinalState{
+			Outcome: types.QueueOutcomeEvictedNoEndpointsTTL,
+			Err:     fmt.Errorf("%w: %w", types.ErrEvicted, types.ErrNoEndpoints),
+		}
+	}
+
+	if fi.effectiveTTL <= 0 {
+		return nil
+	}
+	chargeFrom := fi.enqueueTime
+	if poolNonEmptySince.After(chargeFrom) {
+		chargeFrom = poolNonEmptySince
+	}
+	if now.Sub(chargeFrom) < fi.effectiveTTL {
+		return nil
+	}
+	return &FinalState{
+		Outcome: types.QueueOutcomeEvictedTTL,
+		Err:     fmt.Errorf("%w: %w", types.ErrEvicted, types.ErrTTLExpired),
+	}
+}
 
 // OriginalRequest returns the original FlowControlRequest object.
 func (fi *FlowItem) OriginalRequest() flowcontrol.FlowControlRequest { return fi.originalRequest }

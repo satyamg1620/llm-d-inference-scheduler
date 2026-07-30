@@ -210,8 +210,8 @@ Exposed when the `flowControl` feature gate is enabled.
 
 *   **Type:** Histogram
 *   **Labels:** `fairness_id`, `priority`, `outcome` (`Dispatched`, `RejectedCapacity`,
-    `RejectedOther`, `EvictedTTL`, `EvictedContextCancelled`, `EvictedOther`), `inference_pool`,
-    `model_name`, `target_model_name`
+    `RejectedOther`, `EvictedTTL`, `EvictedNoEndpointsTTL`, `EvictedContextCancelled`,
+    `EvictedOther`), `inference_pool`, `model_name`, `target_model_name`
 *   **Description:** Total time a request spends in the Flow Control layer, from enqueue to final
     outcome.
 *   **Usage:** Primary latency signal for flow control. Rising p99 indicates backends are saturated
@@ -262,7 +262,9 @@ Exposed when the `flowControl` feature gate is enabled.
 *   **Labels:**
     *   `outcome`: terminal outcome, one of `Dispatched`, `RejectedCapacity`, `RejectedNoEndpoints`
         (candidate pool had no endpoints at the capacity boundary; surfaces as HTTP 503 rather than
-        429), `RejectedOther`, `EvictedTTL`, `EvictedContextCancelled`, `EvictedOther`
+        429), `RejectedOther`, `EvictedTTL`, `EvictedNoEndpointsTTL` (queue-wait budget exhausted
+        while the pool had no endpoints; surfaces as HTTP 503), `EvictedContextCancelled`,
+        `EvictedOther`
     *   `priority`, `inference_pool`
 *   **Description:** Total requests processed by the Flow Control layer, incremented once per request
     after its terminal outcome is determined.
@@ -274,8 +276,11 @@ Exposed when the `flowControl` feature gate is enabled.
         saturated - tune `maxBytes`/`maxRequests` or scale backends.
     *   Rising `outcome="RejectedNoEndpoints"`: the pool scaled to zero or all endpoints unregistered
         - investigate pool health and scaling.
-    *   Rising `outcome="EvictedTTL"`: requests waiting longer than their TTL - investigate backend
-        throughput or tighten admission.
+    *   Rising `outcome="EvictedTTL"`: requests waiting out `defaultRequestTTL` against a pool that
+        has endpoints - investigate backend throughput or tighten admission.
+    *   Rising `outcome="EvictedNoEndpointsTTL"`: requests waiting out `noEndpointsRequestTTL` against
+        an empty pool - a scale-from-zero that never completed. Investigate scaling, or raise the
+        budget if cold starts legitimately exceed it.
     *   `outcome="Dispatched"` is the healthy baseline; compare against total request rate for the
         acceptance ratio.
 

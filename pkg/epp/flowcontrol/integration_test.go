@@ -703,12 +703,13 @@ func TestEvictionPipeline(t *testing.T) {
 
 // TestTTLExpiryEvictsQueuedRequest verifies that a request queued under
 // saturation is evicted with QueueOutcomeEvictedTTL + ErrTTLExpired when its
-// TTL expires.
+// TTL expires. The pool must be non-empty for the saturation budget to be the
+// one that binds.
 func TestTTLExpiryEvictsQueuedRequest(t *testing.T) {
 	t.Parallel()
 
 	detector := newBlockedDetector()
-	h := newHarness(t, harnessOpts{detector: detector})
+	h := newHarness(t, harnessOpts{detector: detector, endpointCandidates: nonEmptyCandidates()})
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
@@ -730,6 +731,39 @@ func TestTTLExpiryEvictsQueuedRequest(t *testing.T) {
 			"TTL-expired request should have outcome QueueOutcomeEvictedTTL")
 	case <-time.After(5 * time.Second):
 		t.Fatal("request did not return after TTL expiry")
+	}
+}
+
+// TestNoEndpointsTTLExpiryEvictsQueuedRequest verifies that a request that waits
+// out its budget while the pool is empty is evicted as genuine unavailability
+// rather than as backpressure, so scale-from-zero timeouts stay separable from
+// saturation sheds.
+func TestNoEndpointsTTLExpiryEvictsQueuedRequest(t *testing.T) {
+	t.Parallel()
+
+	// The default harness pool is empty, which is the regime under test.
+	h := newHarness(t, harnessOpts{detector: newBlockedDetector()})
+
+	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
+
+	results := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{id: "no-endpoints-req", key: key, byteSize: 100, ttl: 100 * time.Millisecond}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		results <- dispatchResult{id: "no-endpoints-req", outcome: outcome, err: err}
+	}()
+
+	select {
+	case r := <-results:
+		require.Error(t, r.err)
+		require.ErrorIs(t, r.err, fcTypes.ErrEvicted,
+			"budget-expired request should be wrapped with ErrEvicted")
+		require.ErrorIs(t, r.err, fcTypes.ErrNoEndpoints,
+			"budget-expired request on an empty pool should contain ErrNoEndpoints")
+		require.Equal(t, fcTypes.QueueOutcomeEvictedNoEndpointsTTL, r.outcome,
+			"budget-expired request on an empty pool should have outcome QueueOutcomeEvictedNoEndpointsTTL")
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not return after no-endpoint budget expiry")
 	}
 }
 
@@ -880,10 +914,14 @@ func TestGracefulShutdownDrainsQueuedRequests(t *testing.T) {
 // Production Edge Cases
 // ============================================================================
 
-// TestZombieCapacityStarvation verifies that TTL-expired items still in the
-// queue (zombies) consume capacity until the cleanup sweep runs. If the sweep
-// interval is long, new requests are falsely rejected because capacity is held
-// by dead items.
+// TestZombieCapacityStarvation verifies that items finalized by the controller
+// while still in the queue (zombies) consume capacity until the cleanup sweep
+// runs. If the sweep interval is long, new requests are falsely rejected because
+// capacity is held by dead items.
+//
+// Zombies are produced here by cancelling the caller's context. Queue-wait budget
+// expiry cannot produce them: the sweep that detects an exhausted budget removes
+// the item in the same pass.
 func TestZombieCapacityStarvation(t *testing.T) {
 	t.Parallel()
 
@@ -894,7 +932,7 @@ func TestZombieCapacityStarvation(t *testing.T) {
 		bandMaxRequests:    3,
 		endpointCandidates: nonEmptyCandidates(),
 		controllerCfg: &controller.Config{
-			DefaultRequestTTL:        50 * time.Millisecond,
+			DefaultRequestTTL:        5 * time.Minute,
 			ExpiryCleanupInterval:    10 * time.Second,
 			EnqueueChannelBufferSize: 100,
 		},
@@ -902,23 +940,29 @@ func TestZombieCapacityStarvation(t *testing.T) {
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
-	// Fill capacity with 3 requests that will expire via TTL.
+	// Fill capacity with 3 requests that will be evicted by caller cancellation.
 	expired := make(chan dispatchResult, 3)
+	zombieCtx, zombieCancel := context.WithCancel(h.ctx)
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("zombie-%d", i)
 		go func() {
-			req := &testRequest{id: id, key: key, byteSize: 100, ttl: 50 * time.Millisecond}
-			outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+			req := &testRequest{id: id, key: key, byteSize: 100, ttl: 5 * time.Minute}
+			outcome, err := h.fc.EnqueueAndWait(zombieCtx, req)
 			expired <- dispatchResult{id: id, outcome: outcome, err: err}
 		}()
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Wait for all to expire.
+	require.Eventually(t, func() bool {
+		return h.reg.Stats().TotalLen == 3
+	}, time.Second, time.Millisecond, "all three requests should be queued before cancelling")
+	zombieCancel()
+
+	// Wait for all to be evicted.
 	for i := 0; i < 3; i++ {
 		select {
 		case r := <-expired:
-			require.ErrorIs(t, r.err, fcTypes.ErrTTLExpired)
+			require.ErrorIs(t, r.err, fcTypes.ErrContextCancelled)
 		case <-time.After(5 * time.Second):
 			t.Fatalf("zombie %d did not expire", i)
 		}

@@ -252,6 +252,16 @@ func TestFlowControlAdmissionController_Admit(t *testing.T) {
 			expectHeaders:   map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonTTLExpired)},
 		},
 		{
+			name:            "fc_evict_no_endpoints_ttl",
+			priority:        0,
+			fcOutcome:       fctypes.QueueOutcomeEvictedNoEndpointsTTL,
+			fcErr:           fctypes.ErrNoEndpoints,
+			expectErr:       true,
+			expectErrCode:   errcommon.ServiceUnavailable,
+			expectErrSubstr: "no endpoints available",
+			expectHeaders:   map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonNoEndpoints)},
+		},
+		{
 			name:            "fc_evict_context_cancelled",
 			priority:        0,
 			fcOutcome:       fctypes.QueueOutcomeEvictedContextCancelled,
@@ -342,6 +352,13 @@ func TestTranslateFlowControlOutcome(t *testing.T) {
 			err:        fctypes.ErrTTLExpired,
 			wantCode:   errcommon.ServiceUnavailable,
 			wantReason: string(errcommon.RequestDroppedReasonTTLExpired),
+		},
+		{
+			name:       "no-endpoint budget expiry returns 503",
+			outcome:    fctypes.QueueOutcomeEvictedNoEndpointsTTL,
+			err:        fctypes.ErrNoEndpoints,
+			wantCode:   errcommon.ServiceUnavailable,
+			wantReason: string(errcommon.RequestDroppedReasonNoEndpoints),
 		},
 		{
 			name:       "context cancellation returns 503",

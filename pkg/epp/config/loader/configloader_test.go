@@ -526,6 +526,7 @@ func TestInstantiateAndConfigure(t *testing.T) {
 				require.Equal(t, uint64(1024), cfg.FlowControlConfig.Registry.MaxBytes, "MaxBytes should match yaml")
 				require.NotNil(t, cfg.FlowControlConfig.Controller, "Controller config should be present")
 				require.Equal(t, 1*time.Minute, cfg.FlowControlConfig.Controller.DefaultRequestTTL, "DefaultRequestTTL should match yaml")
+				require.Equal(t, 4*time.Minute, cfg.FlowControlConfig.Controller.NoEndpointsRequestTTL, "NoEndpointsRequestTTL should match yaml")
 				require.Equal(t, 1*time.Second, cfg.FlowControlConfig.Controller.ExpiryCleanupInterval, "ExpiryCleanupInterval should use default")
 
 				// Verify plugins were injected into the Raw Config.

@@ -197,6 +197,11 @@ func (in *FlowControlConfig) DeepCopyInto(out *FlowControlConfig) {
 		*out = new(v1.Duration)
 		**out = **in
 	}
+	if in.NoEndpointsRequestTTL != nil {
+		in, out := &in.NoEndpointsRequestTTL, &out.NoEndpointsRequestTTL
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.DefaultPriorityBand != nil {
 		in, out := &in.DefaultPriorityBand, &out.DefaultPriorityBand
 		*out = new(PriorityBandConfig)

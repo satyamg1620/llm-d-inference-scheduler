@@ -262,6 +262,7 @@ featureGates:
 flowControl:
   maxBytes: "1024"
   defaultRequestTTL: 1m
+  noEndpointsRequestTTL: 4m
 `
 
 const successflowControlConfigDisabledText = `

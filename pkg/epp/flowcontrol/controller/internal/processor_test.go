@@ -193,7 +193,19 @@ func (h *testHarness) waitForFinalization(item *FlowItem) (types.QueueOutcome, e
 func (h *testHarness) newTestItem(id string, key flowcontrol.FlowKey, ttl time.Duration) *FlowItem {
 	h.t.Helper()
 	req := fwkfcmocks.NewMockFlowControlRequest(100, id, key)
-	return NewItem(req, ttl, h.clock.Now())
+	return NewItem(req, ttl, ttl, h.clock.Now())
+}
+
+// setPoolEmpty updates the candidate pool and primes the processor's cached regime state via a dispatch cycle,
+// mirroring the Run loop's periodic dispatch.
+func (h *testHarness) setPoolEmpty(empty bool) {
+	h.t.Helper()
+	if empty {
+		h.endpointCandidates.Candidates = nil
+	} else {
+		h.endpointCandidates.Candidates = []fwkdl.Endpoint{fwkdl.NewEndpoint(nil, nil)}
+	}
+	h.processor.dispatchCycle(context.Background())
 }
 
 // addQueue centrally registers a new mock queue for a given flow, ensuring all harness components are aware of it.
@@ -1183,7 +1195,7 @@ func TestProcessor(t *testing.T) {
 				require.NotNil(t, item.FinalState(), "Item should be finalized")
 
 				// --- ACT ---
-				h.processor.sweepFinalizedItems()
+				h.processor.sweepExpiredAndFinalizedItems()
 
 				// --- ASSERT ---
 				assert.Equal(t, 0, q.Len(), "Queue should be empty after sweep")
@@ -1197,6 +1209,115 @@ func TestProcessor(t *testing.T) {
 					"Drop should be recorded for EvictedContextCancelled")
 			})
 
+			t.Run("should evict items that exhaust the saturation budget", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				// Keep the pool saturated so the item is never dispatched out from under the sweep.
+				h.saturationDetector.SaturationFunc = func(context.Context, []fwkdl.Endpoint) float64 { return 1.0 }
+				q := h.addQueue(testFlow)
+				h.setPoolEmpty(false)
+
+				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-saturation", testFlow), time.Minute, 10*time.Minute, h.clock.Now())
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// --- ACT & ASSERT ---
+				h.clock.Step(59 * time.Second)
+				h.processor.sweepExpiredAndFinalizedItems()
+				require.Nil(t, item.FinalState(), "Item should still wait inside the saturation budget")
+
+				h.clock.Step(2 * time.Second)
+				h.processor.sweepExpiredAndFinalizedItems()
+
+				finalState := item.FinalState()
+				require.NotNil(t, finalState, "Item should be evicted once the saturation budget is exhausted")
+				assert.Equal(t, types.QueueOutcomeEvictedTTL, finalState.Outcome, "Outcome should be EvictedTTL")
+				assert.ErrorIs(t, finalState.Err, types.ErrTTLExpired, "Error should wrap ErrTTLExpired")
+				assert.Equal(t, 0, q.Len(), "Expired item should be removed in the same sweep")
+				assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedTTL].Load(),
+					"Drop should be recorded for EvictedTTL")
+			})
+
+			t.Run("should hold items past the saturation budget while the pool is empty", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				q := h.addQueue(testFlow)
+				h.setPoolEmpty(true)
+
+				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-cold-start", testFlow), 30*time.Second, 10*time.Minute, h.clock.Now())
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// --- ACT ---
+				// Well past the saturation budget: waiting is the only path to success on an empty pool.
+				h.clock.Step(5 * time.Minute)
+				h.processor.sweepExpiredAndFinalizedItems()
+
+				// --- ASSERT ---
+				assert.Nil(t, item.FinalState(), "Item should still wait inside the no-endpoint budget")
+				assert.Equal(t, 1, q.Len(), "Queue should still contain the item")
+			})
+
+			t.Run("should evict items that exhaust the no-endpoint budget as unavailable", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				q := h.addQueue(testFlow)
+				h.setPoolEmpty(true)
+
+				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-no-endpoints", testFlow), time.Minute, 10*time.Minute, h.clock.Now())
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// --- ACT ---
+				h.clock.Step(11 * time.Minute)
+				h.processor.sweepExpiredAndFinalizedItems()
+
+				// --- ASSERT ---
+				finalState := item.FinalState()
+				require.NotNil(t, finalState, "Item should be evicted once the no-endpoint budget is exhausted")
+				assert.Equal(t, types.QueueOutcomeEvictedNoEndpointsTTL, finalState.Outcome,
+					"Outcome should be EvictedNoEndpointsTTL")
+				assert.ErrorIs(t, finalState.Err, types.ErrNoEndpoints, "Error should wrap ErrNoEndpoints")
+				assert.Equal(t, 0, q.Len(), "Expired item should be removed in the same sweep")
+				assert.Equal(t, uint64(1), h.processor.dropCounts[types.QueueOutcomeEvictedNoEndpointsTTL].Load(),
+					"Drop should be recorded for EvictedNoEndpointsTTL")
+			})
+
+			t.Run("should grant a fresh saturation budget when the pool scales up", func(t *testing.T) {
+				t.Parallel()
+				// --- ARRANGE ---
+				h := newTestHarness(t, testCleanupTick)
+				// Keep the pool saturated so scaling up does not dispatch the item before the sweep observes it.
+				h.saturationDetector.SaturationFunc = func(context.Context, []fwkdl.Endpoint) float64 { return 1.0 }
+				q := h.addQueue(testFlow)
+				h.setPoolEmpty(true)
+
+				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-scale-up", testFlow), time.Minute, 10*time.Minute, h.clock.Now())
+				require.NoError(t, q.Add(item), "Failed to add item to queue")
+
+				// The item waits out a cold start, exhausting the saturation budget several times over.
+				h.clock.Step(5 * time.Minute)
+				h.processor.sweepExpiredAndFinalizedItems()
+				require.Nil(t, item.FinalState(), "Item should still wait while the pool is empty")
+
+				// --- ACT ---
+				h.setPoolEmpty(false)
+				h.processor.sweepExpiredAndFinalizedItems()
+
+				// --- ASSERT ---
+				require.Nil(t, item.FinalState(),
+					"Item must not be shed the instant the pool scales up; the saturation budget restarts at the transition")
+
+				h.clock.Step(61 * time.Second)
+				h.processor.sweepExpiredAndFinalizedItems()
+
+				finalState := item.FinalState()
+				require.NotNil(t, finalState, "Item should be evicted once the fresh saturation budget is exhausted")
+				assert.Equal(t, types.QueueOutcomeEvictedTTL, finalState.Outcome,
+					"Outcome should be EvictedTTL once endpoints exist")
+				assert.Equal(t, 0, q.Len(), "Expired item should be removed in the same sweep")
+			})
+
 			t.Run("should not sweep items not finalized", func(t *testing.T) {
 				t.Parallel()
 				// --- ARRANGE ---
@@ -1206,7 +1327,7 @@ func TestProcessor(t *testing.T) {
 				require.NoError(t, q.Add(item), "Failed to add item to queue")
 
 				// --- ACT ---
-				h.processor.sweepFinalizedItems()
+				h.processor.sweepExpiredAndFinalizedItems()
 
 				// --- ASSERT ---
 				assert.Equal(t, 1, q.Len(), "Queue should still contain the item")

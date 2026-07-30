@@ -45,11 +45,6 @@ var (
 var (
 	// ErrQueueAtCapacity indicates that a request could not be enqueued because queue capacity limits were met.
 	ErrQueueAtCapacity = errors.New("queue at capacity")
-
-	// ErrNoEndpoints indicates that a request was rejected at the queue-capacity boundary while the candidate pool had no
-	// endpoints. The queue acts as a scale-from-zero waiting room; when it fills with no backends to drain it, the
-	// rejection reflects genuine unavailability rather than backpressure against a contended pool.
-	ErrNoEndpoints = errors.New("no endpoints available")
 )
 
 // --- Post-Enqueue Eviction Errors ---
@@ -69,6 +64,15 @@ var (
 // --- General `controller.FlowController` Errors ---
 
 var (
+	// ErrNoEndpoints indicates that a request did not dispatch because the candidate pool had no endpoints. The queue
+	// acts as a scale-from-zero waiting room, so this reflects genuine unavailability rather than backpressure against a
+	// contended pool.
+	//
+	// When returned by `FlowController.EnqueueAndWait()`, this will be wrapped by `ErrRejected` (if the queue filled at
+	// the capacity boundary with no backends to drain it) or `ErrEvicted` (if the request exhausted the no-endpoint
+	// queue-wait budget while queued).
+	ErrNoEndpoints = errors.New("no endpoints available")
+
 	// ErrFlowControllerNotRunning indicates that an operation could not complete or an item was evicted because the
 	// `controller.FlowController` is not running or is in the process of shutting down.
 	//

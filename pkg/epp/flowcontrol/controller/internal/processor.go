@@ -81,11 +81,17 @@ type Processor struct {
 	// enqueueChan is the entry point for new requests.
 	enqueueChan chan *FlowItem
 
-	// poolEmpty caches whether the candidate pool had zero endpoints as of the most recent dispatchCycle. enqueue reads
-	// it to distinguish a queue-capacity rejection caused by genuine unavailability (no backends, e.g. scale-from-zero)
-	// from one caused by backpressure against a contended but non-empty pool. Only accessed from the Run goroutine, so
-	// it needs no synchronization.
-	poolEmpty bool
+	// poolEmpty caches whether the candidate pool had zero endpoints as of the most recent dispatchCycle, and
+	// poolNonEmptySinceNanos records when the pool last transitioned from empty to non-empty. Together they define the
+	// unavailability regime in effect.
+	//
+	// enqueue reads poolEmpty to distinguish a queue-capacity rejection caused by genuine unavailability (no backends,
+	// e.g. scale-from-zero) from one caused by backpressure against a contended but non-empty pool. The expiry sweep
+	// reads both to charge an item's queue wait against the budget for the regime actually in effect.
+	//
+	// Written by the Run goroutine and read by the cleanup sweep goroutine, so both are atomic.
+	poolEmpty              atomic.Bool
+	poolNonEmptySinceNanos atomic.Int64
 
 	// wg is used to wait for background tasks (cleanup sweep) to complete on shutdown.
 	wg             sync.WaitGroup
@@ -296,7 +302,7 @@ func (p *Processor) enqueue(item *FlowItem) {
 	if ok, stats := p.hasCapacity(key.Priority, req.ByteSize()); !ok {
 		// When the pool has no endpoints, the queue is acting as a scale-from-zero waiting room. A capacity rejection in
 		// that state reflects genuine unavailability (surfaced as 503), not backpressure against a contended pool (429).
-		if p.poolEmpty {
+		if p.poolEmpty.Load() {
 			p.logger.V(logutil.DEBUG).Info("Rejecting request, queue at capacity with no endpoints",
 				"flowKey", key, "requestID", req.ID(), "reqByteSize", req.ByteSize(),
 				"totalLen", stats.TotalLen, "totalCapacityRequests", stats.TotalCapacityRequests,
@@ -374,7 +380,12 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	}()
 
 	pool := p.endpointCandidates.Locate(ctx, nil)
-	p.poolEmpty = len(pool) == 0
+	poolEmpty := len(pool) == 0
+	if wasEmpty := p.poolEmpty.Swap(poolEmpty); wasEmpty && !poolEmpty {
+		// The pool just scaled up. Items already queued are re-charged from here against the saturation budget, so
+		// they are not shed the instant they become servable.
+		p.poolNonEmptySinceNanos.Store(p.clock.Now().UnixNano())
+	}
 	saturation := p.saturationDetector.Saturation(ctx, pool)
 
 	// Record pool saturation metric
@@ -469,8 +480,8 @@ func (p *Processor) dispatchItem(itemAcc flowcontrol.QueueItemAccessor) error {
 	return nil
 }
 
-// runCleanupSweep starts a background goroutine that periodically scans all queues for externally finalized items
-// ("zombie" items) and removes them in batches.
+// runCleanupSweep starts a background goroutine that periodically scans all queues for items whose queue-wait budget
+// is exhausted and for externally finalized items ("zombie" items), and removes them in batches.
 func (p *Processor) runCleanupSweep(ctx context.Context) {
 	defer p.wg.Done()
 	logger := p.logger.WithName("runCleanupSweep")
@@ -485,31 +496,66 @@ func (p *Processor) runCleanupSweep(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C():
-			p.sweepFinalizedItems()
+			p.sweepExpiredAndFinalizedItems()
 			p.flushDropSummary()
 		}
 	}
 }
 
-// sweepFinalizedItems performs a single scan of all queues, removing finalized items in batch and releasing their
-// memory.
-func (p *Processor) sweepFinalizedItems() {
+// sweepExpiredAndFinalizedItems performs a single scan of all queues, evicting items whose queue-wait budget is
+// exhausted and removing already-finalized items, in batch, releasing their memory.
+//
+// Expiry is enforced here rather than by a deadline fixed at admission because the applicable budget depends on the
+// unavailability regime, which changes while the item waits. The regime is sampled once per sweep so that every queue
+// in the scan is evaluated against the same instant.
+func (p *Processor) sweepExpiredAndFinalizedItems() {
+	now := p.clock.Now()
+	poolEmpty := p.poolEmpty.Load()
+	poolNonEmptySince := time.Unix(0, p.poolNonEmptySinceNanos.Load())
+
 	processFn := func(managedQ contracts.ManagedQueue, logger logr.Logger) {
-		predicate := func(itemAcc flowcontrol.QueueItemAccessor) bool {
-			return itemAcc.(*FlowItem).FinalState() != nil
+		type expiry struct {
+			item  *FlowItem
+			state *FinalState
 		}
+		var expired []expiry
+
+		predicate := func(itemAcc flowcontrol.QueueItemAccessor) bool {
+			fi, ok := itemAcc.(*FlowItem)
+			if !ok || fi == nil {
+				return false
+			}
+			if fi.FinalState() != nil {
+				return true
+			}
+			// Decide only; Cleanup holds the queue lock while the predicate runs.
+			if state := fi.ExpiredState(now, poolEmpty, poolNonEmptySince); state != nil {
+				expired = append(expired, expiry{item: fi, state: state})
+				return true
+			}
+			return false
+		}
+
 		removedItems := managedQ.Cleanup(predicate)
+		for _, e := range expired {
+			req := e.item.OriginalRequest()
+			logger.V(logutil.DEBUG).Info("Evicting request, queue-wait budget exhausted.",
+				"flowKey", req.FlowKey(), "requestID", req.ID(), "outcome", e.state.Outcome,
+				"poolEmpty", poolEmpty, "waited", now.Sub(e.item.EnqueueTime()))
+			e.item.FinalizeWithOutcome(e.state.Outcome, e.state.Err)
+		}
+
 		if len(removedItems) > 0 {
 			for _, itemAcc := range removedItems {
 				if fi, ok := itemAcc.(*FlowItem); ok && fi != nil && fi.FinalState() != nil {
 					p.recordDrop(fi.FinalState().Outcome)
 				}
 			}
-			logger.V(logutil.TRACE).Info("Swept finalized items and released capacity.",
-				"count", len(removedItems))
+			logger.V(logutil.TRACE).Info("Swept expired and finalized items and released capacity.",
+				"count", len(removedItems), "expiredCount", len(expired))
 		}
 	}
-	p.processAllQueuesConcurrently("sweepFinalizedItems", processFn)
+	p.processAllQueuesConcurrently("sweepExpiredAndFinalizedItems", processFn)
 }
 
 // shutdown handles the graceful termination of the processor, ensuring all pending items (in channel and queues) are
