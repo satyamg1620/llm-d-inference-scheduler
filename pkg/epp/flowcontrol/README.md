@@ -104,6 +104,44 @@ flowControl:
     maxBytesPerFlow: "1Mi"
 ```
 
+### Multiple active replicas
+
+Each active EPP replica runs its own flow controller. Queues, fairness accounting, and the queue
+capacity limits (`maxRequests` and `maxBytes`, global and per band) are per replica, so N active
+replicas can together queue up to N times each limit.
+
+A replica dispatches queued requests while pool saturation, as reported by the saturation detector,
+is below the band's usage limit. `utilization-detector` reads model-server metrics, which include
+requests from every replica. `concurrency-detector` reads the in-flight load tracked by the producer
+named in its `inFlightLoadProducerName`:
+
+* Without a cross-replica syncer, the load counts only this replica's requests. Each replica
+  dispatches up to the full pool capacity, so N replicas dispatch up to N times the pool capacity.
+* With a syncer (`dataLayer.crossReplica.syncerPluginRef`) and `syncCrossReplicaState` left at its
+  default on the producer, the load adds the other replicas' published values to this replica's
+  live count. The other replicas' values lag by up to about two `syncInterval` periods (400ms at the
+  default). Requests that reach several replicas within that lag can be dispatched against the same
+  free capacity, and a burst that reaches every replica at once can be dispatched up to N times the
+  pool capacity. If the syncer cannot publish, for example because Redis is unavailable, the last
+  published peer values keep counting until a publication succeeds, and a replica that has not yet
+  published counts only its own requests. A replica that stops publishing while the syncer stays up
+  is dropped from the other replicas' counts after the syncer's `stateTTL`. The
+  `cross-replica publish failed` error log is the only signal of failed publication.
+
+To keep total dispatch within the pool capacity independent of sync lag and syncer health, give each
+replica a fixed share: set `syncCrossReplicaState: false` on the in-flight load producer that
+`concurrency-detector` reads, and set `maxConcurrency` (and `maxTokenConcurrency` in `tokens` and
+`hybrid` modes) to the intended per-endpoint limit divided by the number of active replicas. Fixed
+shares have these costs:
+
+* A change in replica count, including one made by EPP autoscaling, needs a configuration change.
+* A replica does not use capacity that another replica leaves idle. When traffic reaches the
+  replicas unevenly, or a replica is down, requests wait in one replica's queue while the pool runs
+  below capacity.
+* Replicas that share one configuration, as in a Deployment, get equal shares, and `maxConcurrency`
+  is an integer, so a per-endpoint limit that the replica count does not divide is rounded down.
+* Scheduling plugins that read the same producer see only this replica's requests.
+
 ### High Level Architecture
 
 The following diagram illustrates the high-level dependency model and request flow for the system. It shows how
