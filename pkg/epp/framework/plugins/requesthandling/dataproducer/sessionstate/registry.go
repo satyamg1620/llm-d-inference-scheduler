@@ -17,15 +17,21 @@ limitations under the License.
 package sessionstate
 
 import (
+	"container/list"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type sessionRecord struct {
+	identity string
 	// state is guarded by SessionStateRegistry.mu.
 	state       SessionState
 	firstSeenAt time.Time
+	// idleElem is the record's entry in SessionStateRegistry.idle, nil while
+	// the session has a pending or in-flight request. Guarded by
+	// SessionStateRegistry.mu.
+	idleElem *list.Element
 	// pendingRequests counts requests observed at RequestHeader that are not
 	// yet dispatched or abandoned, such as requests waiting in a flow-control
 	// queue. Guarded by SessionStateRegistry.mu.
@@ -57,10 +63,16 @@ func (o observation) state() SessionState {
 }
 
 // SessionStateRegistry stores session history and owns its concurrency rules.
-// Its zero value is ready for use.
+// Its zero value is ready for use and tracks any number of sessions.
 type SessionStateRegistry struct {
-	mu       sync.Mutex
-	sessions map[string]*sessionRecord
+	mu sync.Mutex
+	// maxSessions bounds the number of tracked sessions; zero means unbounded.
+	// Set before first use.
+	maxSessions int
+	sessions    map[string]*sessionRecord
+	// idle holds the sessions without pending or in-flight requests, most
+	// recently active first.
+	idle list.List
 	// pending maps the ID of a request observed at RequestHeader to its
 	// session record until the request is dispatched or abandoned.
 	pending map[string]*sessionRecord
@@ -89,6 +101,7 @@ func (r *SessionStateRegistry) observe(identity, requestID string) observation {
 	prevSeenAt := record.state.LastSeenAt
 	record.state.LastSeenAt = now
 	record.publishLocked()
+	r.refreshIdleLocked(record)
 	return observation{record: record, observedAt: now, prevSeenAt: prevSeenAt}
 }
 
@@ -110,6 +123,7 @@ func (r *SessionStateRegistry) RecordDispatch(identity, requestID string) {
 	record.state.TurnsTaken++
 	record.state.InFlightRequests++
 	record.publishLocked()
+	r.refreshIdleLocked(record)
 }
 
 // TurnUsage is the token usage reported by one response.
@@ -139,6 +153,7 @@ func (r *SessionStateRegistry) RecordResponse(identity string, naturallyComplete
 		record.state.TotalCachedTokens += usage.CachedTokens
 	}
 	record.publishLocked()
+	r.refreshIdleLocked(record)
 }
 
 // ReleasePending ends the pending state of a request that leaves without being
@@ -156,6 +171,7 @@ func (r *SessionStateRegistry) releasePendingLocked(requestID string) {
 	if record, ok := r.pending[requestID]; ok {
 		delete(r.pending, requestID)
 		record.pendingRequests--
+		r.refreshIdleLocked(record)
 	}
 }
 
@@ -169,7 +185,7 @@ func (r *SessionStateRegistry) EvictIdle(now time.Time, ttl time.Duration) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for identity, record := range r.sessions {
+	for _, record := range r.sessions {
 		if record.state.InFlightRequests > 0 || record.pendingRequests > 0 {
 			continue
 		}
@@ -178,9 +194,35 @@ func (r *SessionStateRegistry) EvictIdle(now time.Time, ttl time.Duration) {
 			lastActive = record.state.LastResponseAt
 		}
 		if now.Sub(lastActive) > ttl {
-			delete(r.sessions, identity)
+			r.removeLocked(record)
 		}
 	}
+}
+
+// refreshIdleLocked moves an idle session to the front of the idle list and
+// takes a session with a pending or in-flight request off it, so the bound
+// never evicts a session a request still refers to.
+func (r *SessionStateRegistry) refreshIdleLocked(record *sessionRecord) {
+	if record.pendingRequests > 0 || record.state.InFlightRequests > 0 {
+		if record.idleElem != nil {
+			r.idle.Remove(record.idleElem)
+			record.idleElem = nil
+		}
+		return
+	}
+	if record.idleElem != nil {
+		r.idle.MoveToFront(record.idleElem)
+		return
+	}
+	record.idleElem = r.idle.PushFront(record)
+}
+
+func (r *SessionStateRegistry) removeLocked(record *sessionRecord) {
+	if record.idleElem != nil {
+		r.idle.Remove(record.idleElem)
+		record.idleElem = nil
+	}
+	delete(r.sessions, record.identity)
 }
 
 func (r *SessionStateRegistry) getOrCreate(identity string, now time.Time) *sessionRecord {
@@ -190,7 +232,18 @@ func (r *SessionStateRegistry) getOrCreate(identity string, now time.Time) *sess
 	if record, exists := r.sessions[identity]; exists {
 		return record
 	}
+	// At the bound, idle sessions are evicted, least recently active first.
+	// When every tracked session has a pending or in-flight request, the new
+	// session is added above the bound.
+	for r.maxSessions > 0 && len(r.sessions) >= r.maxSessions {
+		oldest := r.idle.Back()
+		if oldest == nil {
+			break
+		}
+		r.removeLocked(oldest.Value.(*sessionRecord))
+	}
 	record := &sessionRecord{
+		identity: identity,
 		state: SessionState{
 			LastSeenAt: now,
 		},
